@@ -48,8 +48,10 @@ type tomlByteRange struct {
 // this task. Explicit MULTICA_* values are safe to include because daemon.go
 // blocklists that namespace from agent custom_env and constructs those values
 // from the current task. Non-secret explicit custom_env values keep their
-// existing shell visibility; secret-looking custom_env remains filtered just
-// as it was under Codex's default policy.
+// existing shell visibility. Secret-looking values explicitly configured in
+// custom_env are also included: those credentials are task-scoped inputs and
+// must be usable by shell tools. Only inherited host secrets retain Codex's
+// default filtering.
 func CodexShellEnvAllowlist(inherited []string, explicit map[string]string) []string {
 	// Codex's glob matching is case-insensitive. De-duplicate on the same basis
 	// so Windows Path/PATH aliases cannot create ambiguous policy entries.
@@ -63,7 +65,7 @@ func CodexShellEnvAllowlist(inherited []string, explicit map[string]string) []st
 			if !isExplicit {
 				return
 			}
-		} else if codexDefaultExcludesEnvKey(upper) {
+		} else if !isExplicit && codexDefaultExcludesEnvKey(upper) {
 			return
 		}
 		allowed[upper] = key
