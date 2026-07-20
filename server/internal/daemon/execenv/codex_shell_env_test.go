@@ -58,6 +58,7 @@ func TestCodexShellEnvAllowlistUsesExactTaskAndSafeInheritedNames(t *testing.T) 
 
 	got := CodexShellEnvAllowlist(inherited, explicit)
 	want := []string{
+		"ANTHROPIC_API_KEY",
 		"APPDATA",
 		"COMSPEC",
 		"CUSTOM_FLAG",
