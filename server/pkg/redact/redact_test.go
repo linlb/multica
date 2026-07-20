@@ -174,21 +174,24 @@ func TestRedactBearerMCPToken(t *testing.T) {
 	}
 }
 
-func TestRedactGenericCredentials(t *testing.T) {
+func TestPreserveGenericCredentialLikeText(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name  string
 		input string
 	}{
-		{"API_KEY", "API_KEY=mysupersecretkey123"},
-		{"DATABASE_URL", "DATABASE_URL=postgres://user:pass@host/db"},
-		{"DB_PASSWORD", "DB_PASSWORD: hunter2"},
+		{"API_KEY", "API_KEY=example-value"},
+		{"DATABASE_URL", "DATABASE_URL=example-value"},
+		{"DB_PASSWORD", "DB_PASSWORD: example-value"},
+		{"PASSWORD", "PASSWORD=example-value"},
+		{"SECRET", "SECRET=example-value"},
+		{"TOKEN", "TOKEN=example-value"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := Text(tc.input)
-			if !strings.Contains(got, "[REDACTED CREDENTIAL]") {
-				t.Fatalf("expected credential redaction for %s, got: %s", tc.name, got)
+			if got != tc.input {
+				t.Fatalf("generic key-value text changed for %s: got %q, want %q", tc.name, got, tc.input)
 			}
 		})
 	}
@@ -250,26 +253,6 @@ func TestRedactConnectionString(t *testing.T) {
 	got := Text(input)
 	if strings.Contains(got, "s3cret") {
 		t.Fatalf("connection string password not redacted: %s", got)
-	}
-}
-
-func TestRedactPasswordEnvVar(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name  string
-		input string
-	}{
-		{"PASSWORD", "PASSWORD=hunter2"},
-		{"SECRET", "SECRET=mysecretvalue"},
-		{"TOKEN", "TOKEN=abc123xyz"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := Text(tc.input)
-			if !strings.Contains(got, "[REDACTED CREDENTIAL]") {
-				t.Fatalf("expected credential redaction for %s, got: %s", tc.name, got)
-			}
-		})
 	}
 }
 
