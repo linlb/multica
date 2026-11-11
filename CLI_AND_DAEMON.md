@@ -275,6 +275,24 @@ Daemon behavior is configured via flags or environment variables:
 | GC Hermes session TTL (per-conversation `state.db`) | — | `MULTICA_GC_HERMES_SESSION_TTL` | `336h` (14d; set `0` to disable) |
 | GC task temp legacy TTL (pre-lock `multica-task-*`) | — | `MULTICA_GC_TASK_TEMP_LEGACY_TTL` | `0` (disabled; set a duration to opt in) |
 
+Codex timeout diagnostics include the observed `phase`, actual `waited` interval,
+and `in_flight_tools` count. `waiting_first_event` means no item/message/tool
+activity was observed; `waiting_after_progress` means activity stopped after
+progress; `tool_execution` means an observed tool has not returned. Tool counts
+describe protocol observations, not independent proof that a subprocess is
+healthy. These fields do not extend any watchdog budget. Initialize and thread
+setup failures name the unanswered RPC and its deadline separately.
+
+Startup recovery remains limited to two attempts for initialize timeouts or a
+first-event timeout accompanied by a model-catalog refresh failure, with confirmed
+process-tree cleanup. Activity drained during cleanup also prohibits replay.
+An attempted additional instruction (`turn/steer`) suppresses automatic recovery
+because replaying only the original prompt could lose that instruction. Cancellation
+prevents recovery during cleanup and backoff. Model-catalog stderr is diagnostic
+evidence, not proof that a network fault caused a later timeout: inspect the runtime
+path to its configured Codex endpoint before retrying. No per-task network preflight
+or automatic model/runtime/proxy change is performed.
+
 #### Workspace garbage collection
 
 The daemon periodically scans `MULTICA_WORKSPACES_ROOT` and applies several disk-reclamation policies:

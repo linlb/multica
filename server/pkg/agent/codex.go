@@ -302,13 +302,58 @@ const (
 )
 
 type codexTimeoutDiagnostic struct {
-	Kind         codexTimeoutKind
-	Timeout      time.Duration
-	LastActivity string
-	ThreadID     string
-	TurnID       string
-	Model        string
-	CodexVersion string
+	Kind          codexTimeoutKind
+	Timeout       time.Duration
+	Phase         string
+	Waited        time.Duration
+	InFlightTools int
+	LastActivity  string
+	ThreadID      string
+	TurnID        string
+	Model         string
+	CodexVersion  string
+}
+
+// Observe before publishing to best-effort channels. The lifecycle loop may
+// stop consuming when its timer fires, but cleanup can still drain tool events.
+// Those events must prohibit replay even if the loop never consumed them.
+type codexProgressObservation struct {
+	mu       sync.Mutex
+	progress bool
+	tools    map[string]struct{}
+}
+
+func (o *codexProgressObservation) observe(activity string, msg *Message) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if isCodexFirstTurnProgressActivity(activity) {
+		o.progress = true
+	}
+	if msg == nil || msg.CallID == "" {
+		return
+	}
+	switch msg.Type {
+	case MessageToolUse:
+		if o.tools == nil {
+			o.tools = make(map[string]struct{})
+		}
+		o.tools[msg.CallID] = struct{}{}
+	case MessageToolResult:
+		delete(o.tools, msg.CallID)
+	}
+}
+
+func (o *codexProgressObservation) snapshot() (bool, string, int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	phase := "waiting_first_event"
+	if o.progress {
+		phase = "waiting_after_progress"
+	}
+	if len(o.tools) > 0 {
+		phase = "tool_execution"
+	}
+	return o.progress, phase, len(o.tools)
 }
 
 // codexFirstItemWaitObservation records the interval from turn/started to the
@@ -939,13 +984,17 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	resCh := make(chan Result, 1)
 	var sessionMu sync.RWMutex
 	currentSession := firstSession
+	var steeringAttempted atomic.Bool
 	steer := func(steerCtx context.Context, instruction string) error {
 		sessionMu.RLock()
+		defer sessionMu.RUnlock()
 		session := currentSession
-		sessionMu.RUnlock()
 		if session == nil || session.Steer == nil {
 			return errors.New("codex turn is not steerable")
 		}
+		// Even a failed RPC may have reached Codex. A replacement using only
+		// the original prompt would silently drop the additional instruction.
+		steeringAttempted.Store(true)
 		return session.Steer(steerCtx, instruction)
 	}
 
@@ -998,6 +1047,11 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				msgCh <- msg
 			}
 			result, ok := <-session.Result
+			// Retire this attempt before deciding on replay. Holding the write
+			// lock joins any steer RPC that already selected the old session.
+			sessionMu.Lock()
+			currentSession = nil
+			sessionMu.Unlock()
 			if !ok {
 				flushHeldPins()
 				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
@@ -1010,7 +1064,16 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			case result.codexStartupRefreshRetrySafe:
 				retryReason = "model_catalog_refresh"
 			}
-			if retryReason == "" || attempt == 2 {
+			if retryReason == "" || attempt == 2 || steeringAttempted.Load() || ctx.Err() != nil {
+				if retryReason != "" && steeringAttempted.Load() {
+					result.Error += "; automatic startup recovery suppressed: an additional instruction was attempted; review that instruction before retrying"
+				}
+				if retryReason != "" && ctx.Err() != nil {
+					result.Status = "cancelled"
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						result.Status = "timeout"
+					}
+				}
 				flushHeldPins()
 				resCh <- result
 				return
@@ -1039,10 +1102,16 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			b.cfg.Logger.Warn("codex retry scheduled", "reason", retryReason, "attempt", attempt, "next_attempt", attempt+1, "backoff", backoff.String())
 			select {
 			case <-ctx.Done():
+			case <-time.After(backoff):
+			}
+			if ctx.Err() != nil {
 				flushHeldPins()
+				result.Status = "cancelled"
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					result.Status = "timeout"
+				}
 				resCh <- result
 				return
-			case <-time.After(backoff):
 			}
 		}
 	}()
@@ -1221,6 +1290,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// only what the daemon forwards to a chat/channel reply narrows (GH #6006).
 	var finalAnswer, lastAgentMessage string
 	var semanticObserved atomic.Bool
+	progressObservation := &codexProgressObservation{}
 	turnNotificationGate := &codexTurnNotificationGate{}
 	firstItemWait := &codexFirstItemWaitObservation{}
 
@@ -1231,6 +1301,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	observeMessage := func(msg Message) {
 		logCodexAgentMessage(b.cfg.Logger, msg)
 		activity := describeCodexSemanticActivity(msg)
+		progressObservation.observe(activity, &msg)
 		if activity == "status:running" {
 			firstItemWait.start(time.Now())
 		}
@@ -1287,6 +1358,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			outputMu.Unlock()
 		},
 		onSemanticActivity: func(description string) {
+			progressObservation.observe(description, nil)
 			semanticObserved.Store(true)
 			b.cfg.Logger.Debug("codex semantic activity observed", "activity", description)
 			trySendString(semanticActivityCh, description)
@@ -1697,6 +1769,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		var firstTurnNoProgressTimer *time.Timer
 		var firstTurnNoProgressTimerC <-chan time.Time
 		firstTurnStarted := false
+		var firstTurnWaitStarted time.Time
 		firstTurnProgressObserved := false
 		stopFirstTurnNoProgressTimer := func() {
 			if firstTurnNoProgressTimer == nil {
@@ -1717,6 +1790,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				resetTimer(semanticTimer, semanticInactivityTimeout)
 				if activity == "status:running" && !firstTurnStarted {
 					firstTurnStarted = true
+					firstTurnWaitStarted = time.Now()
 					firstItemWait.start(time.Now())
 					firstTurnNoProgressTimer = time.NewTimer(firstTurnNoProgressTimeout)
 					firstTurnNoProgressTimerC = firstTurnNoProgressTimer.C
@@ -1734,13 +1808,17 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				finishFirstItemWait("no_progress_timeout")
 				finalStatus = "timeout"
 				turnID := c.activeTurnID()
+				_, phase, tools := progressObservation.snapshot()
 				timeoutDiagnostic = codexTimeoutDiagnostic{
-					Kind:         codexTimeoutFirstTurnNoProgress,
-					Timeout:      firstTurnNoProgressTimeout,
-					LastActivity: lastSemanticActivityDescription,
-					ThreadID:     threadID,
-					TurnID:       turnID,
-					Model:        opts.Model,
+					Kind:          codexTimeoutFirstTurnNoProgress,
+					Timeout:       firstTurnNoProgressTimeout,
+					Phase:         phase,
+					Waited:        time.Since(firstTurnWaitStarted),
+					InFlightTools: tools,
+					LastActivity:  lastSemanticActivityDescription,
+					ThreadID:      threadID,
+					TurnID:        turnID,
+					Model:         opts.Model,
 				}
 				b.cfg.Logger.Warn(CodexFirstTurnNoProgressMarker,
 					"pid", cmd.Process.Pid,
@@ -1754,13 +1832,17 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				finishFirstItemWait("semantic_inactivity_timeout")
 				finalStatus = "timeout"
 				turnID := c.activeTurnID()
+				_, phase, tools := progressObservation.snapshot()
 				timeoutDiagnostic = codexTimeoutDiagnostic{
-					Kind:         codexTimeoutSemanticInactivity,
-					Timeout:      semanticInactivityTimeout,
-					LastActivity: lastSemanticActivityDescription,
-					ThreadID:     threadID,
-					TurnID:       turnID,
-					Model:        opts.Model,
+					Kind:          codexTimeoutSemanticInactivity,
+					Timeout:       semanticInactivityTimeout,
+					Phase:         phase,
+					Waited:        time.Since(lastSemanticActivity),
+					InFlightTools: tools,
+					LastActivity:  lastSemanticActivityDescription,
+					ThreadID:      threadID,
+					TurnID:        turnID,
+					Model:         opts.Model,
 				}
 				b.cfg.Logger.Warn(CodexSemanticInactivityMarker,
 					"pid", cmd.Process.Pid,
@@ -1822,8 +1904,9 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		// require (cleanupConfirmed plus platform support) rather than a bare
 		// ProcessState check: on Windows the daemon cannot prove the whole tree
 		// is gone, and a surviving app-server would race the retry.
+		progressBeforeCleanupFinished, _, _ := progressObservation.snapshot()
 		startupRefreshRetrySafe := timeoutDiagnostic.Kind == codexTimeoutFirstTurnNoProgress &&
-			!firstTurnProgressObserved &&
+			!progressBeforeCleanupFinished &&
 			strings.Contains(stderrTail, codexModelCatalogRefreshFailureSignal) &&
 			cleanupConfirmed && codexInitializeRetrySupported()
 		if startupRefreshRetrySafe {
@@ -2235,7 +2318,7 @@ func buildCodexTimeoutDiagnosticError(diag codexTimeoutDiagnostic, stderrTail st
 	var msg string
 	switch diag.Kind {
 	case codexTimeoutFirstTurnNoProgress:
-		msg = fmt.Sprintf("%s after %s: received turn start but no item, message, tool, turn/completed, or error event (%s)",
+		msg = fmt.Sprintf("%s after %s: first-event deadline reached (%s)",
 			CodexFirstTurnNoProgressMarker,
 			diag.Timeout,
 			formatCodexDiagnosticFields(diag),
@@ -2255,11 +2338,14 @@ func buildCodexTimeoutDiagnosticError(diag codexTimeoutDiagnostic, stderrTail st
 }
 
 func formatCodexDiagnosticFields(diag codexTimeoutDiagnostic) string {
-	return fmt.Sprintf("codex_version=%q thread_id=%q turn_id=%q model=%q",
+	return fmt.Sprintf("codex_version=%q thread_id=%q turn_id=%q model=%q phase=%q waited=%s in_flight_tools=%d",
 		nonEmptyCodexDiagnosticValue(diag.CodexVersion),
 		nonEmptyCodexDiagnosticValue(diag.ThreadID),
 		nonEmptyCodexDiagnosticValue(diag.TurnID),
 		formatCodexDiagnosticModel(diag.Model),
+		nonEmptyCodexDiagnosticValue(diag.Phase),
+		diag.Waited.Round(time.Millisecond),
+		diag.InFlightTools,
 	)
 }
 
@@ -2279,7 +2365,7 @@ func formatCodexDiagnosticModel(model string) string {
 
 func appendCodexKnownStderrHint(msg, stderrTail string) string {
 	if strings.Contains(stderrTail, codexModelCatalogRefreshFailureSignal) {
-		return msg + "; diagnosis: Codex could not load its model catalog, which blocks the first turn. This is usually a transient network failure reaching the Codex service. Check network/proxy connectivity and retry the task, or switch to another runtime while the Codex service is unreachable"
+		return msg + "; diagnosis: Codex could not load its model catalog. This may delay startup, but does not by itself establish the cause of this timeout. Check runtime network/proxy connectivity to the configured Codex service; retry after connectivity recovers"
 	}
 	return msg
 }
@@ -2902,6 +2988,11 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 
 	var method string
 	_ = json.Unmarshal(raw["method"], &method)
+	// An approval/elicitation request can precede item/started. Account for it
+	// before replying, including when the reader is draining during cleanup.
+	if c.onSemanticActivity != nil {
+		c.onSemanticActivity("server_request:" + method)
+	}
 
 	// Auto-approve all exec/patch requests in daemon mode
 	switch method {
